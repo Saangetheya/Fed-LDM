@@ -2,87 +2,37 @@ import torch
 from torch.utils.data import Dataset
 import os
 import pandas as pd
-import nibabel as nib
-import numpy as np
-import random
-from scipy.ndimage import zoom
 import SimpleITK as sitk
 
 def load_sitk_image(path):
     image = sitk.ReadImage(path)
     return image
 
-def resize_3d(volume, target_shape):
-    """
-    Resize a 3D volume to target shape using scipy.ndimage.zoom
-    
-    Args:
-        volume (np.ndarray): Input 3D volume of shape [H, W, L]
-        target_shape (tuple): Target shape [h, w, l]
-        
-    Returns:
-        np.ndarray: Resized volume of shape [h, w, l]
-    """
-    # Calculate zoom factors for each dimension
-    zoom_factors = [t / s for t, s in zip(target_shape, volume.shape)]
-    
-    # Apply zoom
-    resized_volume = zoom(volume, zoom_factors, order=3)  # order=3 for cubic interpolation
-    
-    return resized_volume
-
-class MonaiMRIDataset(Dataset):
-    def __init__(self, root_dir, index_file, output_size, apply_padding=True):
-        with open(os.path.join(root_dir, index_file), 'r') as f:
-            self.file_paths = [line.strip() for line in f if line.strip()]
-        
-        self.root_dir = root_dir
-        self.output_size = output_size
-        self.apply_padding = apply_padding
-
-        if self.apply_padding:
-            self.padding = Padding(output_size)
-
-    def __len__(self):
-        return len(self.file_paths)
-    
-    def __getitem__(self, idx):
-        item = self.file_paths[idx].split(",")
-        
-        t1_image_path = os.path.join(item[1])
-        
-        # Load with SimpleITK
-        t1_image = load_sitk_image(t1_image_path)
-
-        sample = {'t1_image': t1_image}
-
-        # Apply padding if needed
-        if self.apply_padding:
-            sample = self.padding(sample)
-
-        # Convert to NumPy
-        t1_np = sitk.GetArrayFromImage(sample['t1_image'])  # (D, H, W)
-
-        # Normalize to [0, 1]
-        t1_np = (t1_np - t1_np.min()) / (t1_np.max() - t1_np.min() + 1e-5)
-
-        # Convert to tensors and add channel dim
-        t1_tensor = torch.from_numpy(t1_np).unsqueeze(0).float()  # (1, D, H, W)
-
-        return {"t1_image": t1_tensor, "dx": str(row["DX"]), "sex": str(row["SEX"])}
-
 # Diagnosis labels shared by all sites: 0 = CN, 1 = AD. NULL_LABEL (2) is the "no label"
-# token used for classifier-free guidance in train_diffusion.py.
+# token used for classifier-free guidance in train_diffusion.py -- it covers MCI, other
+# diagnoses outside this AD-vs-CN scheme, and missing/NaN values.
 CN_LABEL, AD_LABEL, NULL_LABEL = 0, 1, 2
 
 
 def _adni_label(dx):
-    return {"CN": CN_LABEL, "Dementia": AD_LABEL}[str(dx).strip()]
+    # Tolerates both representations in use across ADNI CSVs: the original ADNI1/2/GO
+    # fedpath files still spell this out as "CN"/"Dementia" strings, while
+    # ADNI3_T1_9DOF_demographics.csv has DX remapped in place to 0/1 directly.
+    if isinstance(dx, str):
+        return {"CN": CN_LABEL, "Dementia": AD_LABEL}.get(dx.strip(), NULL_LABEL)
+    try:
+        code = int(dx)  # raises on NaN, which is the missing-DX case
+    except (ValueError, TypeError):
+        return NULL_LABEL
+    return {CN_LABEL: CN_LABEL, AD_LABEL: AD_LABEL}.get(code, NULL_LABEL)
 
 
-def _nacc_label(dx_adsp):
-    # ASSUMPTION: DX_ADSP 1 = CN, 3 = AD (only values present in the ADvsCN split). Verify against the NACC dictionary.
-    return {1: CN_LABEL, 3: AD_LABEL}[int(dx_adsp)]
+def _nacc_label(dx):
+    # The NACC_ADvsCN_*.csv files were remapped in place (original DX_ADSP codes 1=CN,
+    # 3=AD -> 0=CN, 1=AD; column itself renamed DX_ADSP -> DX for consistency with ADNI) so
+    # this already matches CN_LABEL/AD_LABEL directly. Falls back to NULL_LABEL (not an
+    # error) for any other value, in case a differently-coded CSV is ever pointed at this loader.
+    return {CN_LABEL: CN_LABEL, AD_LABEL: AD_LABEL}.get(int(dx), NULL_LABEL)
 
 
 def _load_t1_tensor(path, padding):
@@ -108,7 +58,7 @@ class MonaiMRIDatasetADNI(Dataset):
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        t1_tensor = _load_t1_tensor(str(row["FED_Path"]).strip(), self.padding)
+        t1_tensor = _load_t1_tensor(str(row["path"]).strip(), self.padding)
         return {
             "t1_image": t1_tensor,
             "label": torch.tensor(_adni_label(row["DX"]), dtype=torch.long),
@@ -129,49 +79,12 @@ class MonaiMRIDatasetNACC(Dataset):
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        t1_tensor = _load_t1_tensor(str(row["FED_Path"]).strip(), self.padding)
+        t1_tensor = _load_t1_tensor(str(row["path"]).strip(), self.padding)
         return {
             "t1_image": t1_tensor,
-            "label": torch.tensor(_nacc_label(row["DX_ADSP"]), dtype=torch.long),
+            "label": torch.tensor(_nacc_label(row["DX"]), dtype=torch.long),
             "sex": str(row["SEX"]),
         }
-
-class Resample(object):
-    """
-    Resample the volume in a sample to a given voxel size
-
-      Args:
-          voxel_size (float or tuple): Desired output size.
-          If float, output volume is isotropic.
-          If tuple, output voxel size is matched with voxel size
-          Currently only support linear interpolation method
-    """
-
-    def __init__(self, new_resolution, check):
-        self.name = 'Resample'
-
-        # assert isinstance(new_resolution, (float, tuple))
-        if isinstance(new_resolution, float):
-            self.new_resolution = new_resolution
-            self.check = check
-        else:
-            # assert len(new_resolution) == 3
-            self.new_resolution = new_resolution
-            self.check = check
-
-    def __call__(self, sample):
-        image = sample['t1_image']
-
-        new_resolution = self.new_resolution
-        check = self.check
-
-        if check is True:
-            image = resample_sitk_image(image, spacing=new_resolution, interpolator=_interpolator_image)
-
-            return {'t1_image': image}
-
-        if check is False:
-            return {'t1_image': image}
 
 class Padding(object):
     """
