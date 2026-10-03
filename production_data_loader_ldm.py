@@ -11,7 +11,9 @@ CSV format handled (all sites):
     (ACCEL_DL_9DOF_2MM_T1 / NONACCEL_DL_9DOF_2MM_T1 / DL_9DOF_2MM_T1 / FED_Path).
     Paths start with /ifs/...; they are rewritten to DATA_ROOT + /ifs/...
   - Diagnosis: DX as 0/1 (also "0.0"/"1.0", or CN/Dementia text), or NACC's
-    DX_ADSP 1/3. Rows with a missing or unrecognized diagnosis are dropped.
+    DX_ADSP 1/3. Rows with a missing or unrecognized diagnosis (blank, MCI, any
+    other code) are KEPT with NULL_LABEL (2), as in the colleague's dataset.py:
+    Stage 1 doesn't use labels, and 2 is the "no label" token Stage 2 uses.
   - SEX is passed through.
 
 Mount each node's data folder (the one containing ifs/ and the CSV) at
@@ -64,30 +66,31 @@ def rewrite_path(path):
 
 def prepare_site_table(csv_path):
     """Read a site CSV and return a DataFrame with standard columns
-    image_path / label / sex, dropping rows without a usable diagnosis."""
+    image_path / label / dx / sex. Rows without a usable CN/AD diagnosis are kept,
+    with label NULL_LABEL."""
     df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
     image_col = next((c for c in IMAGE_PATH_COLUMNS if c in df.columns), None)
     if image_col is None:
         raise ValueError(f"{csv_path}: none of the image columns {IMAGE_PATH_COLUMNS} found; "
                          f"columns are {list(df.columns)}")
     if "DX" in df.columns:
-        labels = df["DX"].str.strip().map(_DX_MAP)
+        raw_dx = df["DX"].str.strip()
+        labels = raw_dx.map(_DX_MAP)
     elif "DX_ADSP" in df.columns:
-        labels = df["DX_ADSP"].str.strip().map(_DX_ADSP_MAP)
+        raw_dx = df["DX_ADSP"].str.strip()
+        labels = raw_dx.map(_DX_ADSP_MAP)
     else:
         raise ValueError(f"{csv_path}: no DX or DX_ADSP column; columns are {list(df.columns)}")
-    out = pd.DataFrame({
+    n_null = int(labels.isna().sum())
+    if n_null:
+        print(f"Note: {os.path.basename(csv_path)}: {n_null} of {len(df)} rows have a missing or "
+              f"non-CN/AD diagnosis; kept with NULL label {NULL_LABEL}", flush=True)
+    return pd.DataFrame({
         "image_path": df[image_col].map(rewrite_path),
-        "label": labels,
+        "label": labels.fillna(NULL_LABEL).astype(int),
+        "dx": raw_dx,
         "sex": df["SEX"] if "SEX" in df.columns else "",
-    })
-    n_bad = int(out["label"].isna().sum())
-    if n_bad:
-        print(f"Warning: {os.path.basename(csv_path)}: dropping {n_bad} rows with missing or "
-              f"unrecognized diagnosis ({len(out) - n_bad} rows kept)", flush=True)
-        out = out.dropna(subset=["label"])
-    out["label"] = out["label"].astype(int)
-    return out.reset_index(drop=True)
+    }).reset_index(drop=True)
 
 
 class Padding(object):
@@ -142,7 +145,7 @@ class SiteMRIDataset(Dataset):
         return {
             "t1_image": _load_t1_tensor(row["image_path"], self.padding),
             "label": torch.tensor(label, dtype=torch.long),
-            "dx": "CN" if label == CN_LABEL else "AD",
+            "dx": str(row["dx"]),
             "sex": str(row["sex"]),
         }
 
