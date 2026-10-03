@@ -31,8 +31,13 @@ def _nacc_label(dx):
     # The NACC_ADvsCN_*.csv files were remapped in place (original DX_ADSP codes 1=CN,
     # 3=AD -> 0=CN, 1=AD; column itself renamed DX_ADSP -> DX for consistency with ADNI) so
     # this already matches CN_LABEL/AD_LABEL directly. Falls back to NULL_LABEL (not an
-    # error) for any other value, in case a differently-coded CSV is ever pointed at this loader.
-    return {CN_LABEL: CN_LABEL, AD_LABEL: AD_LABEL}.get(int(dx), NULL_LABEL)
+    # error) for any other value -- including NaN/missing, which int() can't convert -- in
+    # case a differently-coded or incomplete CSV is ever pointed at this loader.
+    try:
+        code = int(dx)
+    except (ValueError, TypeError):
+        return NULL_LABEL
+    return {CN_LABEL: CN_LABEL, AD_LABEL: AD_LABEL}.get(code, NULL_LABEL)
 
 
 def _load_t1_tensor(path, padding):
