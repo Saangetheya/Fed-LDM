@@ -20,15 +20,14 @@ matplotlib.use("Agg")  # headless plotting for batch jobs
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
-import wandb
-from monai.utils import first, set_determinism
+from monai.utils import set_determinism
 from torch.cuda.amp import GradScaler, autocast
 
 from generative.inferers import LatentDiffusionInferer
 from generative.networks.nets import AutoencoderKL, DiffusionModelUNet
 from generative.networks.schedulers import DDPMScheduler
 
-from dataset import NULL_LABEL, MonaiMRIDatasetADNI
+from dataset import NULL_LABEL, MonaiMRIDataset
 from torch.utils.data import DataLoader
 
 
@@ -49,15 +48,12 @@ def parse_args():
     )
     p.add_argument("--out-dir", default="/data/ashaji/FedNeuro")
     p.add_argument("--ckpt-name", default="ldm_checkpoint_modified_final.pt")
-    p.add_argument("--wandb-project", default="fedneuro-ldm")
-    p.add_argument("--wandb-run-name", default=None)
-    p.add_argument("--wandb-entity", default=None)
-    p.add_argument("--wandb-group", default="autoencoder-ldm-a100")
     p.add_argument(
-        "--wandb-mode",
-        default="online",
-        choices=["online", "offline", "disabled"],
-        help="online streams live to wandb.ai; use offline if the compute node has no internet (needs `wandb sync` after)",
+        "--scale-factor",
+        type=float,
+        required=True,
+        help="latent scale factor = 1 / std of the autoencoder's SAMPLED latents (encode_stage_2_inputs), "
+        "precomputed over the training scans with the same frozen autoencoder",
     )
     p.add_argument("--cross-attention-dim", type=int, default=64, help="size of the diagnosis embedding fed to the UNet cross-attention")
     p.add_argument(
@@ -84,17 +80,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using {device}")
 
-    wandb.init(
-        project=args.wandb_project,
-        entity=args.wandb_entity,
-        name=args.wandb_run_name,
-        group=args.wandb_group,
-        mode=args.wandb_mode,
-        config=vars(args),
-    )
-
     # ── Data ──────────────────────────────────────────────────────────────
-    train_dataset = MonaiMRIDatasetADNI(args.train_csv, output_size=tuple(args.output_size), apply_padding=True)
+    train_dataset = MonaiMRIDataset(args.train_csv, output_size=tuple(args.output_size), apply_padding=True)
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers
     )
@@ -138,12 +125,9 @@ def main():
     scheduler = DDPMScheduler(num_train_timesteps=1000, schedule="scaled_linear_beta", beta_start=0.0015, beta_end=0.0195)
 
     # ── Scaling factor ────────────────────────────────────────────────────
-    check_data = first(train_loader)
-    with torch.no_grad():
-        with autocast(enabled=True):
-            z = autoencoder.encode_stage_2_inputs(check_data["t1_image"].to(device))
-    scale_factor = 1 / torch.std(z)
-    print(f"Scaling factor set to {scale_factor}")
+    # Precomputed over the training scans (not estimated from one batch), so the latents fed to the
+    # diffusion model have std ~1, matching the noise. Must match the frozen autoencoder above.
+    scale_factor = args.scale_factor
 
     inferer = LatentDiffusionInferer(scheduler, scale_factor=scale_factor)
     optimizer_diff = torch.optim.Adam(params=list(unet.parameters()) + list(label_embed.parameters()), lr=args.lr)
@@ -195,7 +179,6 @@ def main():
 
         avg_loss = epoch_loss / n_steps
         epoch_loss_list.append(avg_loss)
-        wandb.log({"epoch": epoch, "loss": avg_loss})
         if avg_loss < best_loss:
             best_loss = avg_loss
             checkpoint = {
@@ -203,7 +186,7 @@ def main():
                 "unet_state_dict": unet.state_dict(),
                 "label_embed_state_dict": label_embed.state_dict(),
                 "cross_attention_dim": args.cross_attention_dim,
-                "scale_factor": scale_factor.item(),
+                "scale_factor": scale_factor,
                 "optimizer_state_dict": optimizer_diff.state_dict(),
                 "scaler_state_dict": scaler.state_dict(),
                 "loss": avg_loss,
@@ -215,7 +198,7 @@ def main():
         "unet_state_dict": unet.state_dict(),
         "label_embed_state_dict": label_embed.state_dict(),
         "cross_attention_dim": args.cross_attention_dim,
-        "scale_factor": scale_factor.item(),
+        "scale_factor": scale_factor,
         "optimizer_state_dict": optimizer_diff.state_dict(),
         "scaler_state_dict": scaler.state_dict(),
     }
@@ -230,8 +213,6 @@ def main():
     plt.ylabel("Loss", fontsize=16)
     plt.legend()
     plt.savefig(os.path.join(args.out_dir, "diffusion_train_loss.png"))
-
-    wandb.finish()
 
 
 if __name__ == "__main__":
